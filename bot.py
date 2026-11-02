@@ -65,20 +65,31 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(message.text) > 4000:
         await message.reply_text('El mensaje supera los 4000 caracteres.')
         return
+
+    # Visible, persistent progress message; Telegram's typing indicator alone expires.
+    status = await message.reply_text('⏳ DarkGPT está procesando tu solicitud…\n🤖 Qwen2.5 está generando la respuesta.')
     typing_task = asyncio.create_task(mantener_escribiendo(context.bot, update.effective_chat.id))
     try:
         answer = await asyncio.to_thread(query_bridge, message.text)
+        await status.edit_text('✅ Respuesta terminada. Enviando resultado…')
         for i in range(0, len(answer), 3900):
             await message.reply_text(answer[i:i + 3900])
+        await status.edit_text('✅ Respuesta terminada.')
     except requests.exceptions.Timeout:
         logger.exception('Tiempo de espera agotado consultando Bridge')
-        await message.reply_text('⏱️ La IA tardó demasiado. Prueba una pregunta más corta.')
+        await status.edit_text('⏱️ La IA tardó demasiado. Prueba una pregunta más corta.')
     except requests.exceptions.HTTPError as exc:
         logger.error('Bridge devolvió HTTP %s', exc.response.status_code if exc.response is not None else '?')
-        await message.reply_text('❌ El servidor de IA devolvió un error. Revisa Bridge y llama-server.')
+        await status.edit_text('❌ El servidor de IA devolvió un error. Revisa Bridge y llama-server.')
     except (requests.exceptions.RequestException, ValueError):
         logger.exception('Fallo al consultar Bridge')
-        await message.reply_text('🔌 No se pudo consultar la IA local. Comprueba la MacBook y Cloudflare.')
+        await status.edit_text('🔌 No se pudo consultar la IA local. Comprueba la MacBook y Cloudflare.')
+    except Exception:
+        logger.exception('Error inesperado procesando mensaje')
+        try:
+            await status.edit_text('❌ Ocurrió un error procesando la solicitud. Revisa los logs de Render.')
+        except Exception:
+            logger.exception('No se pudo actualizar el estado')
     finally:
         typing_task.cancel()
         await typing_task
