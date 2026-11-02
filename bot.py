@@ -1,117 +1,102 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""DarkGPT Telegram Bot conectado a un modelo local mediante Bridge autenticado."""
+"""DarkGPT Telegram Bot para Bridge con trabajos asincrónicos."""
 import asyncio
 import logging
 import os
 import sys
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import time
 import requests
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import threading
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+                    format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 BRIDGE_URL = os.getenv('BRIDGE_URL', '').rstrip('/')
 BRIDGE_SECRET = os.getenv('BRIDGE_SECRET', '')
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
-TIMEOUT = 190
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+HEADERS = {'Authorization': 'Bearer ' + BRIDGE_SECRET}
+MAX_WAIT = 1200
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        '🌑 DarkGPT Local\n\n🤖 Modelo: Qwen2.5-Coder 3B en MacBook.\n'
-        'Envía una pregunta para recibir una respuesta.\n\n'
-        'Comandos: /start /help /features /clear\n\n'
-        'La MacBook y su túnel deben permanecer encendidos.')
+def submit_job(message):
+    r = requests.post(BRIDGE_URL + '/jobs', json={'message': message}, headers=HEADERS, timeout=25)
+    r.raise_for_status()
+    return r.json()['id']
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        'Escribe una pregunta en texto. El bot la enviará a tu IA local.\n'
-        'No incluye generación de imágenes, videos ni búsqueda web en tiempo real.')
+def fetch_job(job_id):
+    r = requests.get(BRIDGE_URL + '/jobs/' + job_id, headers=HEADERS, timeout=25)
+    r.raise_for_status()
+    return r.json()
 
-async def cmd_features(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        'Funciones actuales: respuestas en español, ayuda con programación y '
-        'consultas de texto. Cada pregunta se procesa de forma independiente.')
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('🌑 DarkGPT Local\n🤖 Qwen2.5-Coder 3B en MacBook.\nEnvíame una pregunta. Para respuestas largas esperaré a que termine la IA.')
 
-async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('✅ Listo. Este bot no almacena historial de conversación.')
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('Escribe tu pregunta. /start /help /features /clear. Cada consulta es independiente.')
 
-def request_bridge(message):
-    response = requests.post(
-        BRIDGE_URL + '/chat',
-        json={'message': message},
-        headers={'Authorization': 'Bearer ' + BRIDGE_SECRET},
-        timeout=TIMEOUT,
-    )
-    response.raise_for_status()
-    result = response.json()
-    answer = result.get('response')
-    if not isinstance(answer, str) or not answer.strip():
-        raise ValueError('Respuesta vacía o inválida del Bridge')
-    return answer
+async def features(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('Respuestas en español, programación y textos largos divididos en mensajes.')
 
-async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message.text
-    if len(message) > 4000:
-        await update.message.reply_text('El mensaje supera el límite de 4000 caracteres.')
-        return
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id,
-                                       action=ChatAction.TYPING)
+async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('✅ Este bot no guarda historial de conversación.')
+
+async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prompt = update.message.text
+    if len(prompt) > 4000:
+        return await update.message.reply_text('El mensaje supera los 4000 caracteres.')
+    notice = await update.message.reply_text('⏳ Qwen2.5 está procesando tu solicitud...')
     try:
-        # requests es síncrono: usar hilo para no bloquear otras conversaciones.
-        answer = await asyncio.to_thread(request_bridge, message)
-        for i in range(0, len(answer), 3900):
-            await update.message.reply_text(answer[i:i+3900])
-    except requests.exceptions.Timeout:
-        await update.message.reply_text('⏱️ La IA tardó demasiado en responder. Intenta una pregunta más corta.')
-    except requests.exceptions.HTTPError as exc:
-        logger.error('Bridge HTTP error: %s', exc.response.status_code if exc.response else 'unknown')
-        await update.message.reply_text('❌ El servidor de IA devolvió un error. Revisa Bridge y Cloudflare.')
-    except (requests.exceptions.RequestException, ValueError):
-        logger.exception('Error consultando el Bridge')
-        await update.message.reply_text('🔌 No se pudo consultar la IA local. Comprueba la Mac y el túnel.')
+        job_id = await asyncio.to_thread(submit_job, prompt)
+        started = time.monotonic()
+        while time.monotonic() - started < MAX_WAIT:
+            await asyncio.sleep(8)
+            job = await asyncio.to_thread(fetch_job, job_id)
+            if job.get('status') == 'done':
+                answer = job.get('response', '')
+                if not answer:
+                    raise ValueError('Respuesta vacía')
+                await notice.edit_text('✅ Respuesta terminada:')
+                for i in range(0, len(answer), 3500):
+                    await update.message.reply_text(answer[i:i+3500])
+                return
+            if job.get('status') == 'error':
+                logger.error('Bridge job failed: %s', job.get('error'))
+                return await notice.edit_text('❌ Qwen2.5 no pudo completar la respuesta. Revisa los registros del Bridge.')
+        await notice.edit_text('⏱️ La respuesta tardó demasiado. Prueba una solicitud más corta.')
+    except (requests.RequestException, KeyError, ValueError):
+        logger.exception('Fallo comunicando con Bridge')
+        await notice.edit_text('🔌 Error de conexión con el Bridge. Comprueba Mac, Cloudflare y BRIDGE_URL.')
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path not in ('/', '/health'):
-            self.send_error(404)
-            return
+            return self.send_error(404)
         payload = b'{"status":"ok"}'
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
-
     def log_message(self, fmt, *args):
         pass
 
-
-def start_health_server():
-    port = int(os.getenv('PORT', '10000'))
-    server = ThreadingHTTPServer(('0.0.0.0', port), HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    logger.info('Health HTTP escuchando en puerto %s', port)
-    return server
-
-
 def main():
-    if not all((BRIDGE_URL.startswith('https://'), BRIDGE_SECRET, TELEGRAM_BOT_TOKEN)):
-        raise SystemExit('Configura BRIDGE_URL (HTTPS), BRIDGE_SECRET y TELEGRAM_BOT_TOKEN en Render.')
-    start_health_server()
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler('start', cmd_start))
-    app.add_handler(CommandHandler('help', cmd_help))
-    app.add_handler(CommandHandler('features', cmd_features))
-    app.add_handler(CommandHandler('clear', cmd_clear))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_message))
-    logger.info('DarkGPT Local iniciado')
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    if not (BRIDGE_URL.startswith('https://') and BRIDGE_SECRET and TOKEN):
+        raise SystemExit('Configura BRIDGE_URL, BRIDGE_SECRET y TELEGRAM_BOT_TOKEN en Render')
+    server = ThreadingHTTPServer(('0.0.0.0', int(os.getenv('PORT', '10000'))), HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('help', help_cmd))
+    app.add_handler(CommandHandler('features', features))
+    app.add_handler(CommandHandler('clear', clear))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+    logger.info('DarkGPT iniciado')
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
