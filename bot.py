@@ -10,6 +10,7 @@ import os
 import sys
 import logging
 import requests
+import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from collections import defaultdict
@@ -177,7 +178,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         action="typing"
     )
     
-    logger.info(f"User {user_id} ({user_name}): {user_msg[:50]}...")
+    logger.info("Processing Telegram message for user %s", user_id)
     
     try:
         # Add user message to history
@@ -216,7 +217,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         # Make API request
         logger.info(f"Calling API: {API_ENDPOINT}")
-        api_response = requests.post(
+        api_response = await asyncio.to_thread(requests.post,
             API_ENDPOINT,
             json=api_payload,
             headers={
@@ -342,10 +343,25 @@ def main():
     logger.info("🚀 Bot started successfully!")
     logger.info("Waiting for messages...")
     
-    # Run bot with polling
-    application.run_polling(
+    # Render Web Service: Telegram webhook + HTTP listener.
+    base_url = (os.environ.get("WEBHOOK_URL") or
+                os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+    if not base_url.startswith("https://"):
+        logger.error("Set WEBHOOK_URL to your public HTTPS Render URL")
+        sys.exit(1)
+    secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+    if not secret:
+        logger.error("Set TELEGRAM_WEBHOOK_SECRET to a random secret")
+        sys.exit(1)
+    port = int(os.environ.get("PORT", "10000"))
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path="telegram",
+        webhook_url=f"{base_url}/telegram",
+        secret_token=secret,
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True
+        drop_pending_updates=True,
     )
 
 
