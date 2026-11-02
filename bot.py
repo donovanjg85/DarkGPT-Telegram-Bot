@@ -1,102 +1,135 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""DarkGPT Telegram Bot para Bridge con trabajos asincrónicos."""
+"""DarkGPT Telegram webhook on Render, backed by an authenticated local bridge."""
 import asyncio
 import logging
 import os
 import sys
-import time
+
 import requests
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import threading
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-logging.basicConfig(level=logging.INFO, stream=sys.stdout,
-                    format='%(asctime)s %(levelname)s %(message)s')
-logger = logging.getLogger(__name__)
-BRIDGE_URL = os.getenv('BRIDGE_URL', '').rstrip('/')
-BRIDGE_SECRET = os.getenv('BRIDGE_SECRET', '')
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
-HEADERS = {'Authorization': 'Bearer ' + BRIDGE_SECRET}
-MAX_WAIT = 1200
+logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s %(levelname)s %(message)s')
+logger = logging.getLogger('darkgpt')
 
-def submit_job(message):
-    r = requests.post(BRIDGE_URL + '/jobs', json={'message': message}, headers=HEADERS, timeout=25)
-    r.raise_for_status()
-    return r.json()['id']
-
-def fetch_job(job_id):
-    r = requests.get(BRIDGE_URL + '/jobs/' + job_id, headers=HEADERS, timeout=25)
-    r.raise_for_status()
-    return r.json()
+TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
+BRIDGE_URL = os.environ.get('BRIDGE_URL', '').rstrip('/')
+BRIDGE_SECRET = os.environ.get('BRIDGE_SECRET', '')
+WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', '')
+RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL', '').rstrip('/')
+PORT = int(os.environ.get('PORT', '10000'))
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🌑 DarkGPT Local\n🤖 Qwen2.5-Coder 3B en MacBook.\nEnvíame una pregunta. Para respuestas largas esperaré a que termine la IA.')
+    await update.message.reply_text('🌑 DarkGPT Local\n\n🤖 Qwen2.5-Coder 3B en MacBook.\nEnvía una pregunta para recibir una respuesta.\n\nComandos: /start /help /features /clear\n\nLa MacBook, llama-server, Bridge y Cloudflare deben permanecer activos.')
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Escribe tu pregunta. /start /help /features /clear. Cada consulta es independiente.')
+    await update.message.reply_text('Envía texto para consultar la IA local. No incluye búsqueda web ni generación de imágenes.')
 
 async def features(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Respuestas en español, programación y textos largos divididos en mensajes.')
+    await update.message.reply_text('Respuestas en español, programación y consultas de texto. Cada pregunta se procesa independientemente.')
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('✅ Este bot no guarda historial de conversación.')
+    await update.message.reply_text('✅ Este bot no conserva historial de conversación.')
 
-async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prompt = update.message.text
-    if len(prompt) > 4000:
-        return await update.message.reply_text('El mensaje supera los 4000 caracteres.')
-    notice = await update.message.reply_text('⏳ Qwen2.5 está procesando tu solicitud...')
+def query_bridge(message: str) -> str:
+    response = requests.post(
+        BRIDGE_URL + '/chat',
+        json={'message': message},
+        headers={'Authorization': 'Bearer ' + BRIDGE_SECRET},
+        timeout=(15, 240),
+    )
+    response.raise_for_status()
+    result = response.json()
+    answer = result.get('response')
+    if not isinstance(answer, str) or not answer.strip():
+        raise ValueError('Respuesta vacía o inválida del Bridge')
+    return answer
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if not message or not message.text:
+        return
+    if len(message.text) > 4000:
+        await message.reply_text('El mensaje supera los 4000 caracteres.')
+        return
     try:
-        job_id = await asyncio.to_thread(submit_job, prompt)
-        started = time.monotonic()
-        while time.monotonic() - started < MAX_WAIT:
-            await asyncio.sleep(8)
-            job = await asyncio.to_thread(fetch_job, job_id)
-            if job.get('status') == 'done':
-                answer = job.get('response', '')
-                if not answer:
-                    raise ValueError('Respuesta vacía')
-                await notice.edit_text('✅ Respuesta terminada:')
-                for i in range(0, len(answer), 3500):
-                    await update.message.reply_text(answer[i:i+3500])
-                return
-            if job.get('status') == 'error':
-                logger.error('Bridge job failed: %s', job.get('error'))
-                return await notice.edit_text('❌ Qwen2.5 no pudo completar la respuesta. Revisa los registros del Bridge.')
-        await notice.edit_text('⏱️ La respuesta tardó demasiado. Prueba una solicitud más corta.')
-    except (requests.RequestException, KeyError, ValueError):
-        logger.exception('Fallo comunicando con Bridge')
-        await notice.edit_text('🔌 Error de conexión con el Bridge. Comprueba Mac, Cloudflare y BRIDGE_URL.')
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        answer = await asyncio.to_thread(query_bridge, message.text)
+        for i in range(0, len(answer), 3900):
+            await message.reply_text(answer[i:i + 3900])
+    except requests.exceptions.Timeout:
+        logger.exception('Tiempo de espera agotado consultando Bridge')
+        await message.reply_text('⏱️ La IA tardó demasiado. Prueba una pregunta más corta.')
+    except requests.exceptions.HTTPError as exc:
+        logger.error('Bridge devolvió HTTP %s', exc.response.status_code if exc.response is not None else '?')
+        await message.reply_text('❌ El servidor de IA devolvió un error. Revisa Bridge y llama-server.')
+    except (requests.exceptions.RequestException, ValueError):
+        logger.exception('Fallo al consultar Bridge')
+        await message.reply_text('🔌 No se pudo consultar la IA local. Comprueba la MacBook y Cloudflare.')
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path not in ('/', '/health'):
-            return self.send_error(404)
-        payload = b'{"status":"ok"}'
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-    def log_message(self, fmt, *args):
-        pass
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error('Error procesando actualización de Telegram: %s', context.error, exc_info=context.error)
 
-def main():
-    if not (BRIDGE_URL.startswith('https://') and BRIDGE_SECRET and TOKEN):
-        raise SystemExit('Configura BRIDGE_URL, BRIDGE_SECRET y TELEGRAM_BOT_TOKEN en Render')
-    server = ThreadingHTTPServer(('0.0.0.0', int(os.getenv('PORT', '10000'))), HealthHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    app = Application.builder().token(TOKEN).build()
+async def main():
+    if not TOKEN or not BRIDGE_SECRET or not BRIDGE_URL.startswith('https://'):
+        raise SystemExit('Faltan TELEGRAM_BOT_TOKEN, BRIDGE_SECRET o BRIDGE_URL (HTTPS).')
+    if not WEBHOOK_SECRET or not RENDER_EXTERNAL_URL.startswith('https://'):
+        raise SystemExit('Faltan WEBHOOK_SECRET o RENDER_EXTERNAL_URL (HTTPS).')
+    app = Application.builder().token(TOKEN).updater(None).concurrent_updates(True).build()
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('help', help_cmd))
     app.add_handler(CommandHandler('features', features))
     app.add_handler(CommandHandler('clear', clear))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
-    logger.info('DarkGPT iniciado')
-    app.run_polling(drop_pending_updates=True)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    app.add_error_handler(error_handler)
+
+    # Aiohttp responds to Telegram immediately, then processes the update asynchronously.
+    from aiohttp import web
+
+    async def health(request):
+        return web.json_response({'status': 'ok'})
+
+    async def webhook(request):
+        if request.headers.get('X-Telegram-Bot-Api-Secret-Token', '') != WEBHOOK_SECRET:
+            return web.Response(status=403)
+        try:
+            data = await request.json()
+            update = Update.de_json(data, app.bot)
+            if update is None:
+                return web.Response(status=400)
+            await app.update_queue.put(update)
+        except (ValueError, TypeError):
+            logger.exception('Actualización inválida')
+            return web.Response(status=400)
+        return web.Response(text='OK')
+
+    server = web.Application(client_max_size=1024 * 1024)
+    server.router.add_get('/', health)
+    server.router.add_get('/health', health)
+    server.router.add_post('/telegram', webhook)
+    runner = web.AppRunner(server)
+    await app.initialize()
+    await app.start()
+    try:
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', PORT)
+        await site.start()
+        await app.bot.set_webhook(
+            url=RENDER_EXTERNAL_URL + '/telegram',
+            secret_token=WEBHOOK_SECRET,
+            allowed_updates=['message'],
+            drop_pending_updates=False,
+        )
+        logger.info('Webhook configurado en %s/telegram', RENDER_EXTERNAL_URL)
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
+        await app.stop()
+        await app.shutdown()
 
 if __name__ == '__main__':
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
