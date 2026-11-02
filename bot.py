@@ -44,47 +44,77 @@ def bridge_request(method, path, **kwargs):
     return response.json()
 
 
-def render_telegram_html(text: str) -> str:
-    """Format common Markdown as safe Telegram HTML, including fenced code."""
-    parts = []
-    in_code = False
-    code_lines = []
+# Telegram permite hasta 4096 caracteres tras interpretar HTML.
+# Usamos un margen para que las etiquetas y entidades no alcancen el límite.
+MAX_TEXT = 3000
+FENCE = re.compile(r"(?m)^\s{0,3}```[^\n]*\n")
+
+
+def format_prose(text: str) -> str:
+    """Convierte Markdown sencillo en HTML seguro, sin modificar el código."""
+    lines = []
     for line in text.splitlines(keepends=True):
-        match = re.match(r"^\s*```([a-zA-Z0-9_+.-]*)\s*$", line.rstrip("\r\n"))
-        if match:
-            if in_code:
-                parts.append('<pre><code>' + html.escape(''.join(code_lines)) + '</code></pre>\n')
-                code_lines = []
-                in_code = False
+        escaped = html.escape(line)
+        escaped = re.sub(r"^(\s{0,3})#{1,6}\s+(.+?)(\r?\n)?$",
+                         lambda m: m.group(1) + '<b>' + m.group(2) + '</b>' + (m.group(3) or ''), escaped)
+        escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
+        escaped = re.sub(r"(?<!`)`([^`\n]+)`(?!`)", r"<code>\1</code>", escaped)
+        lines.append(escaped)
+    return ''.join(lines)
+
+
+def split_plain(text: str, limit: int = MAX_TEXT):
+    """Separa sin eliminar caracteres ni modificar saltos de línea."""
+    while text:
+        if len(text) <= limit:
+            yield text
+            return
+        cut = text.rfind('\n', 0, limit + 1)
+        if cut <= 0:
+            cut = text.rfind(' ', 0, limit + 1)
+        if cut <= 0:
+            cut = limit
+        else:
+            cut += 1
+        yield text[:cut]
+        text = text[cut:]
+
+
+def extract_ready(buffer: str, final: bool = False):
+    """Entrega solo secciones completas; retiene bloques ``` sin cerrar.
+
+    Devuelve (secciones, resto). Cada sección es ('code'|'prose', texto).
+    """
+    sections = []
+    while buffer:
+        opening = FENCE.search(buffer)
+        if not opening:
+            if final:
+                sections.append(('prose', buffer))
+                buffer = ''
             else:
-                in_code = True
-            continue
-        if in_code:
-            code_lines.append(line)
-            continue
-        clean = html.escape(line)
-        # Headings are bold, not literal ### markers.
-        clean = re.sub(r'^\s{0,3}#{1,6}\s+(.+?)(\n?)$', r'<b>\1</b>\2', clean)
-        clean = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', clean)
-        clean = re.sub(r'(?<!\*)`([^`\n]+)`(?!`)', r'<code>\1</code>', clean)
-        parts.append(clean)
-    if in_code:
-        parts.append('<pre><code>' + html.escape(''.join(code_lines)) + '</code></pre>')
-    return ''.join(parts).strip() or html.escape(text)
-
-
-def take_safe_piece(text: str, limit: int = 2600):
-    """Split at a newline when possible; keep enough room for HTML markup."""
-    if len(text) <= limit:
-        return text, ''
-    cut = text.rfind('\n', 0, limit)
-    if cut < limit // 3:
-        cut = text.rfind(' ', 0, limit)
-    if cut < limit // 3:
-        cut = limit
-    else:
-        cut += 1
-    return text[:cut], text[cut:]
+                # Conservar el último tramo para detectar ``` dividido entre chunks.
+                safe = max(0, len(buffer) - 12)
+                if safe > 0:
+                    sections.append(('prose', buffer[:safe]))
+                    buffer = buffer[safe:]
+            break
+        if opening.start():
+            sections.append(('prose', buffer[:opening.start()]))
+        buffer = buffer[opening.start():]
+        opening = FENCE.match(buffer)
+        closing = re.search(r"(?m)^\s{0,3}```\s*(?:\n|$)", buffer[opening.end():])
+        if closing is None:
+            if final:
+                # No inventar un cierre: presentar contenido tal cual en texto plano.
+                sections.append(('prose', buffer))
+                buffer = ''
+            break
+        end = opening.end() + closing.end()
+        sections.append(('code', buffer[opening.end():opening.end() + closing.start()]))
+        closing_text = buffer[opening.end() + closing.start():end]
+        buffer = ('\n' if closing_text.endswith('\n') else '') + buffer[end:]
+    return sections, buffer
 
 
 async def deliver_job(message, status, prompt):
@@ -97,30 +127,33 @@ async def deliver_job(message, status, prompt):
     last_delivery = started
     delivered = 0
 
-    async def send_piece(piece):
+    async def send_section(kind, text):
         nonlocal delivered, last_delivery
-        if not piece.strip():
+        if not text.strip():
             return
-        formatted = render_telegram_html(piece)
-        try:
-            await message.reply_text(formatted, parse_mode='HTML', disable_web_page_preview=True)
-        except Exception:
-            logger.exception('HTML no admitido; enviando texto plano')
-            await message.reply_text(piece, parse_mode=None, disable_web_page_preview=True)
-        delivered += 1
-        last_delivery = asyncio.get_running_loop().time()
+        for piece in split_plain(text):
+            if not piece.strip():
+                continue
+            if kind == 'code':
+                formatted = '<pre><code>' + html.escape(piece) + '</code></pre>'
+            else:
+                formatted = format_prose(piece)
+            try:
+                await message.reply_text(formatted, parse_mode='HTML', disable_web_page_preview=True)
+            except Exception:
+                logger.exception('No se pudo enviar HTML; reintentando como texto plano')
+                await message.reply_text(piece, parse_mode=None, disable_web_page_preview=True)
+            delivered += 1
+            last_delivery = asyncio.get_running_loop().time()
 
     async def drain(force=False):
         nonlocal pending
-        # Send the first part promptly; subsequent messages at moderate intervals.
+        # Esperar a tener suficiente texto, pero no partir bloques de código.
         if not force and len(pending) < 750 and (not pending or asyncio.get_running_loop().time() - last_delivery < 12):
             return
-        while len(pending) > 2600:
-            piece, pending = take_safe_piece(pending)
-            await send_piece(piece)
-        if force or len(pending) >= 750 or (pending and asyncio.get_running_loop().time() - last_delivery >= 12):
-            piece, pending = pending, ''
-            await send_piece(piece)
+        sections, pending = extract_ready(pending, final=force)
+        for kind, text in sections:
+            await send_section(kind, text)
 
     while True:
         if asyncio.get_running_loop().time() - started > 1200:
