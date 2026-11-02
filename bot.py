@@ -46,6 +46,18 @@ def query_bridge(message: str) -> str:
         raise ValueError('Respuesta vacía o inválida del Bridge')
     return answer
 
+async def mantener_escribiendo(bot, chat_id: int):
+    """Renueva el indicador de escritura hasta que termine la respuesta."""
+    try:
+        while True:
+            try:
+                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            except Exception:
+                logger.exception('No se pudo actualizar el indicador de escritura')
+            await asyncio.sleep(4)
+    except asyncio.CancelledError:
+        return
+
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if not message or not message.text:
@@ -53,8 +65,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(message.text) > 4000:
         await message.reply_text('El mensaje supera los 4000 caracteres.')
         return
+    typing_task = asyncio.create_task(mantener_escribiendo(context.bot, update.effective_chat.id))
     try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
         answer = await asyncio.to_thread(query_bridge, message.text)
         for i in range(0, len(answer), 3900):
             await message.reply_text(answer[i:i + 3900])
@@ -67,6 +79,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (requests.exceptions.RequestException, ValueError):
         logger.exception('Fallo al consultar Bridge')
         await message.reply_text('🔌 No se pudo consultar la IA local. Comprueba la MacBook y Cloudflare.')
+    finally:
+        typing_task.cancel()
+        await typing_task
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error('Error procesando actualización de Telegram: %s', context.error, exc_info=context.error)
