@@ -5,6 +5,8 @@ import asyncio
 import logging
 import os
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import requests
 from telegram import Update
 from telegram.constants import ChatAction
@@ -73,9 +75,35 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.exception('Error consultando el Bridge')
         await update.message.reply_text('🔌 No se pudo consultar la IA local. Comprueba la Mac y el túnel.')
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path not in ('/', '/health'):
+            self.send_error(404)
+            return
+        payload = b'{"status":"ok"}'
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def start_health_server():
+    port = int(os.getenv('PORT', '10000'))
+    server = ThreadingHTTPServer(('0.0.0.0', port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info('Health HTTP escuchando en puerto %s', port)
+    return server
+
+
 def main():
     if not all((BRIDGE_URL.startswith('https://'), BRIDGE_SECRET, TELEGRAM_BOT_TOKEN)):
         raise SystemExit('Configura BRIDGE_URL (HTTPS), BRIDGE_SECRET y TELEGRAM_BOT_TOKEN en Render.')
+    start_health_server()
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler('start', cmd_start))
     app.add_handler(CommandHandler('help', cmd_help))
