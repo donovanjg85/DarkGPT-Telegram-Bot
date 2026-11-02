@@ -32,19 +32,60 @@ async def features(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('✅ Este bot no conserva historial de conversación.')
 
-def query_bridge(message: str) -> str:
-    response = requests.post(
-        BRIDGE_URL + '/chat',
-        json={'message': message},
+def bridge_request(method, path, **kwargs):
+    response = requests.request(
+        method, BRIDGE_URL + path,
         headers={'Authorization': 'Bearer ' + BRIDGE_SECRET},
-        timeout=(15, 240),
+        timeout=(15, 35), **kwargs
     )
     response.raise_for_status()
-    result = response.json()
-    answer = result.get('response')
-    if not isinstance(answer, str) or not answer.strip():
-        raise ValueError('Respuesta vacía o inválida del Bridge')
-    return answer
+    return response.json()
+
+
+async def deliver_job(message, status, prompt):
+    created = await asyncio.to_thread(bridge_request, 'POST', '/jobs', json={'message': prompt})
+    job_id = created['job_id']
+    sent = 0
+    previous_state = None
+    # Bridge retains all chunks so a transient network error can be retried safely.
+    started = asyncio.get_running_loop().time()
+    failures = 0
+    while True:
+        if asyncio.get_running_loop().time() - started > 1200:
+            await status.edit_text('⏱️ Se alcanzó el tiempo máximo de seguimiento (20 min).')
+            return
+        await asyncio.sleep(3)
+        try:
+            job = await asyncio.to_thread(bridge_request, 'GET', '/jobs/' + job_id)
+            failures = 0
+        except requests.exceptions.RequestException:
+            failures += 1
+            if failures > 10:
+                raise
+            await asyncio.sleep(min(failures * 2, 15))
+            continue
+        chunks = job.get('chunks') or []
+        # Each chunk is <= 1600 characters; Telegram plain text allows 4096.
+        for chunk in chunks[sent:]:
+            if chunk:
+                await message.reply_text(chunk)
+            sent += 1
+        state = job.get('state')
+        if sent and state == 'running' and (sent != previous_state):
+            await status.edit_text(f'⏳ DarkGPT sigue generando… Partes recibidas: {sent}')
+        previous_state = sent
+        if state == 'done':
+            await status.edit_text('✅ Respuesta terminada.')
+            return
+        if state == 'limit':
+            await status.edit_text('⚠️ Respuesta incompleta: Qwen alcanzó el límite de tokens. Puedes pedir una continuación.')
+            return
+        if state == 'error':
+            await status.edit_text('❌ Se interrumpió la generación. ' + str(job.get('error') or 'Revisa el Bridge.')[:180])
+            return
+        if state != 'running':
+            raise ValueError('Estado desconocido del Bridge: ' + str(state))
+
 
 async def mantener_escribiendo(bot, chat_id: int):
     """Renueva el indicador de escritura hasta que termine la respuesta."""
@@ -70,11 +111,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await message.reply_text('⏳ DarkGPT está procesando tu solicitud…\n🤖 Qwen2.5 está generando la respuesta.')
     typing_task = asyncio.create_task(mantener_escribiendo(context.bot, update.effective_chat.id))
     try:
-        answer = await asyncio.to_thread(query_bridge, message.text)
-        await status.edit_text('✅ Respuesta terminada. Enviando resultado…')
-        for i in range(0, len(answer), 3900):
-            await message.reply_text(answer[i:i + 3900])
-        await status.edit_text('✅ Respuesta terminada.')
+        await deliver_job(message, status, message.text)
     except requests.exceptions.Timeout:
         logger.exception('Tiempo de espera agotado consultando Bridge')
         await status.edit_text('⏱️ La IA tardó demasiado. Prueba una pregunta más corta.')
