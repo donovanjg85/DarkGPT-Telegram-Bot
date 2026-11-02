@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """DarkGPT Telegram webhook on Render, backed by an authenticated local bridge."""
 import asyncio
+import html
+import re
 import logging
 import os
 import sys
@@ -42,50 +44,122 @@ def bridge_request(method, path, **kwargs):
     return response.json()
 
 
+def render_telegram_html(text: str) -> str:
+    """Format common Markdown as safe Telegram HTML, including fenced code."""
+    parts = []
+    in_code = False
+    code_lines = []
+    for line in text.splitlines(keepends=True):
+        match = re.match(r"^\s*```([a-zA-Z0-9_+.-]*)\s*$", line.rstrip("\r\n"))
+        if match:
+            if in_code:
+                parts.append('<pre><code>' + html.escape(''.join(code_lines)) + '</code></pre>\n')
+                code_lines = []
+                in_code = False
+            else:
+                in_code = True
+            continue
+        if in_code:
+            code_lines.append(line)
+            continue
+        clean = html.escape(line)
+        # Headings are bold, not literal ### markers.
+        clean = re.sub(r'^\s{0,3}#{1,6}\s+(.+?)(\n?)$', r'<b>\1</b>\2', clean)
+        clean = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', clean)
+        clean = re.sub(r'(?<!\*)`([^`\n]+)`(?!`)', r'<code>\1</code>', clean)
+        parts.append(clean)
+    if in_code:
+        parts.append('<pre><code>' + html.escape(''.join(code_lines)) + '</code></pre>')
+    return ''.join(parts).strip() or html.escape(text)
+
+
+def take_safe_piece(text: str, limit: int = 2600):
+    """Split at a newline when possible; keep enough room for HTML markup."""
+    if len(text) <= limit:
+        return text, ''
+    cut = text.rfind('\n', 0, limit)
+    if cut < limit // 3:
+        cut = text.rfind(' ', 0, limit)
+    if cut < limit // 3:
+        cut = limit
+    else:
+        cut += 1
+    return text[:cut], text[cut:]
+
+
 async def deliver_job(message, status, prompt):
     created = await asyncio.to_thread(bridge_request, 'POST', '/jobs', json={'message': prompt})
     job_id = created['job_id']
-    sent = 0
-    previous_state = None
-    # Bridge retains all chunks so a transient network error can be retried safely.
-    started = asyncio.get_running_loop().time()
+    received = 0
+    pending = ''
     failures = 0
+    started = asyncio.get_running_loop().time()
+    last_delivery = started
+    delivered = 0
+
+    async def send_piece(piece):
+        nonlocal delivered, last_delivery
+        if not piece.strip():
+            return
+        formatted = render_telegram_html(piece)
+        try:
+            await message.reply_text(formatted, parse_mode='HTML', disable_web_page_preview=True)
+        except Exception:
+            logger.exception('HTML no admitido; enviando texto plano')
+            await message.reply_text(piece, parse_mode=None, disable_web_page_preview=True)
+        delivered += 1
+        last_delivery = asyncio.get_running_loop().time()
+
+    async def drain(force=False):
+        nonlocal pending
+        # Send the first part promptly; subsequent messages at moderate intervals.
+        if not force and len(pending) < 750 and (not pending or asyncio.get_running_loop().time() - last_delivery < 12):
+            return
+        while len(pending) > 2600:
+            piece, pending = take_safe_piece(pending)
+            await send_piece(piece)
+        if force or len(pending) >= 750 or (pending and asyncio.get_running_loop().time() - last_delivery >= 12):
+            piece, pending = pending, ''
+            await send_piece(piece)
+
     while True:
         if asyncio.get_running_loop().time() - started > 1200:
-            await status.edit_text('⏱️ Se alcanzó el tiempo máximo de seguimiento (20 min).')
+            await drain(force=True)
+            await status.edit_text('⏱️ Se alcanzó el tiempo máximo de seguimiento (20 min). Respuesta posiblemente incompleta.')
             return
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
         try:
             job = await asyncio.to_thread(bridge_request, 'GET', '/jobs/' + job_id)
             failures = 0
         except requests.exceptions.RequestException:
             failures += 1
             if failures > 10:
+                await drain(force=True)
                 raise
             await asyncio.sleep(min(failures * 2, 15))
             continue
         chunks = job.get('chunks') or []
-        # Each chunk is <= 1600 characters; Telegram plain text allows 4096.
-        for chunk in chunks[sent:]:
-            if chunk:
-                await message.reply_text(chunk)
-            sent += 1
+        if not isinstance(chunks, list) or len(chunks) < received:
+            raise ValueError('Fragmentos inválidos del Bridge')
+        for chunk in chunks[received:]:
+            if not isinstance(chunk, str):
+                raise ValueError('Fragmento no válido')
+            pending += chunk
+        received = len(chunks)
         state = job.get('state')
-        if sent and state == 'running' and (sent != previous_state):
-            await status.edit_text(f'⏳ DarkGPT sigue generando… Partes recibidas: {sent}')
-        previous_state = sent
+        await drain(force=state in ('done', 'limit', 'error'))
+        if state == 'running':
+            continue
         if state == 'done':
-            await status.edit_text('✅ Respuesta terminada.')
+            await status.edit_text(f'✅ Respuesta terminada. Mensajes enviados: {delivered}.')
             return
         if state == 'limit':
-            await status.edit_text('⚠️ Respuesta incompleta: Qwen alcanzó el límite de tokens. Puedes pedir una continuación.')
+            await status.edit_text('⚠️ Respuesta incompleta: Qwen alcanzó el límite de tokens.')
             return
         if state == 'error':
-            await status.edit_text('❌ Se interrumpió la generación. ' + str(job.get('error') or 'Revisa el Bridge.')[:180])
+            await status.edit_text('❌ Generación interrumpida: ' + str(job.get('error') or 'Revisa Bridge')[:180])
             return
-        if state != 'running':
-            raise ValueError('Estado desconocido del Bridge: ' + str(state))
-
+        raise ValueError('Estado desconocido: ' + str(state))
 
 async def mantener_escribiendo(bot, chat_id: int):
     """Renueva el indicador de escritura hasta que termine la respuesta."""
